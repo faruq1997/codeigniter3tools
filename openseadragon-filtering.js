@@ -12,482 +12,627 @@
 
 /**
  *
- * @author Antoine Vandecreme <antoine.vandecreme@nist.gov>
+ * @author Antoine Vandecreme <antoine.vandecreme@nist.gov> dikembangkan oleh chatGPT. Hehe
  */
-(function() {
+(function () {
+  'use strict';
 
-    'use strict';
-
-    var $ = window.OpenSeadragon;
+  var $ = window.OpenSeadragon;
+  if (!$) {
+    $ = require('openseadragon');
     if (!$) {
-        $ = require('openseadragon');
-        if (!$) {
-            throw new Error('OpenSeadragon is missing.');
-        }
+      throw new Error('OpenSeadragon is missing.');
     }
-    // Requires OpenSeadragon >=2.1
-    if (!$.version || $.version.major < 2 ||
-        $.version.major === 2 && $.version.minor < 1) {
-        throw new Error(
-            'Filtering plugin requires OpenSeadragon version >= 2.1');
+  }
+  // Requires OpenSeadragon >=2.1
+  if (!$.version || $.version.major < 2 || ($.version.major === 2 && $.version.minor < 1)) {
+    throw new Error('Filtering plugin requires OpenSeadragon version >= 2.1');
+  }
+
+  $.Viewer.prototype.setFilterOptions = function (options) {
+    if (!this.filterPluginInstance) {
+      options = options || {};
+      options.viewer = this;
+      this.filterPluginInstance = new $.FilterPlugin(options);
+    } else {
+      setOptions(this.filterPluginInstance, options);
+    }
+  };
+
+  /**
+   * @class FilterPlugin
+   * @param {Object} options The options
+   * @param {OpenSeadragon.Viewer} options.viewer The viewer to attach this
+   * plugin to.
+   * @param {String} [options.loadMode='async'] Set to sync to have the filters
+   * applied synchronously. It will only work if the filters are all synchronous.
+   * Note that depending on how complex the filters are, it may also hang the browser.
+   * @param {Object[]} options.filters The filters to apply to the images.
+   * @param {OpenSeadragon.TiledImage[]} options.filters[x].items The tiled images
+   * on which to apply the filter.
+   * @param {function|function[]} options.filters[x].processors The processing
+   * function(s) to apply to the images. The parameters of this function are
+   * the context to modify and a callback to call upon completion.
+   */
+  $.FilterPlugin = function (options) {
+    options = options || {};
+    if (!options.viewer) {
+      throw new Error('A viewer must be specified.');
+    }
+    var self = this;
+    this.viewer = options.viewer;
+
+    this.viewer.addHandler('tile-loaded', tileLoadedHandler);
+    this.viewer.addHandler('tile-drawing', tileDrawingHandler);
+
+    // filterIncrement allows to determine whether a tile contains the
+    // latest filters results.
+    this.filterIncrement = 0;
+
+    setOptions(this, options);
+
+    function tileLoadedHandler(event) {
+      var processors = getFiltersProcessors(self, event.tiledImage);
+      if (processors.length === 0) {
+        return;
+      }
+      var tile = event.tile;
+      var image = event.image;
+      if (image !== null && image !== undefined) {
+        var canvas = window.document.createElement('canvas');
+        canvas.width = image.width;
+        canvas.height = image.height;
+        var context = canvas.getContext('2d');
+        context.drawImage(image, 0, 0);
+        tile._renderedContext = context;
+        var callback = event.getCompletionCallback();
+        applyFilters(context, processors, callback);
+        tile._filterIncrement = self.filterIncrement;
+      }
     }
 
-    $.Viewer.prototype.setFilterOptions = function(options) {
-        if (!this.filterPluginInstance) {
-            options = options || {};
-            options.viewer = this;
-            this.filterPluginInstance = new $.FilterPlugin(options);
+    function applyFilters(context, filtersProcessors, callback) {
+      if (callback) {
+        var currentIncrement = self.filterIncrement;
+        var callbacks = [];
+        for (var i = 0; i < filtersProcessors.length - 1; i++) {
+          (function (i) {
+            callbacks[i] = function () {
+              // If the increment has changed, stop the computation
+              // chain immediately.
+              if (self.filterIncrement !== currentIncrement) {
+                return;
+              }
+              filtersProcessors[i + 1](context, callbacks[i + 1]);
+            };
+          })(i);
+        }
+        callbacks[filtersProcessors.length - 1] = function () {
+          // If the increment has changed, do not call the callback.
+          // (We don't want OSD to draw an outdated tile in the canvas).
+          if (self.filterIncrement !== currentIncrement) {
+            return;
+          }
+          callback();
+        };
+        filtersProcessors[0](context, callbacks[0]);
+      } else {
+        for (var i = 0; i < filtersProcessors.length; i++) {
+          filtersProcessors[i](context, function () {});
+        }
+      }
+    }
+
+    function tileDrawingHandler(event) {
+      var tile = event.tile;
+      var rendered = event.rendered;
+      if (rendered._filterIncrement === self.filterIncrement) {
+        return;
+      }
+      var processors = getFiltersProcessors(self, event.tiledImage);
+      if (processors.length === 0) {
+        if (rendered._originalImageData) {
+          // Restore initial data.
+          rendered.putImageData(rendered._originalImageData, 0, 0);
+          delete rendered._originalImageData;
+        }
+        rendered._filterIncrement = self.filterIncrement;
+        return;
+      }
+
+      if (rendered._originalImageData) {
+        // The tile has been previously filtered (by another filter),
+        // restore it first.
+        rendered.putImageData(rendered._originalImageData, 0, 0);
+      } else {
+        rendered._originalImageData = rendered.getImageData(0, 0, rendered.canvas.width, rendered.canvas.height);
+      }
+
+      if (tile._renderedContext) {
+        if (tile._filterIncrement === self.filterIncrement) {
+          var imgData = tile._renderedContext.getImageData(0, 0, tile._renderedContext.canvas.width, tile._renderedContext.canvas.height);
+          rendered.putImageData(imgData, 0, 0);
+          delete tile._renderedContext;
+          delete tile._filterIncrement;
+          rendered._filterIncrement = self.filterIncrement;
+          return;
+        }
+        delete tile._renderedContext;
+        delete tile._filterIncrement;
+      }
+      applyFilters(rendered, processors);
+      rendered._filterIncrement = self.filterIncrement;
+    }
+  };
+
+  function setOptions(instance, options) {
+    options = options || {};
+    var filters = options.filters;
+    instance.filters = !filters ? [] : $.isArray(filters) ? filters : [filters];
+    for (var i = 0; i < instance.filters.length; i++) {
+      var filter = instance.filters[i];
+      if (!filter.processors) {
+        throw new Error('Filter processors must be specified.');
+      }
+      filter.processors = $.isArray(filter.processors) ? filter.processors : [filter.processors];
+    }
+    instance.filterIncrement++;
+
+    if (options.loadMode === 'sync') {
+      instance.viewer.forceRedraw();
+    } else {
+      var itemsToReset = [];
+      for (var i = 0; i < instance.filters.length; i++) {
+        var filter = instance.filters[i];
+        if (!filter.items) {
+          itemsToReset = getAllItems(instance.viewer.world);
+          break;
+        }
+        if ($.isArray(filter.items)) {
+          for (var j = 0; j < filter.items.length; j++) {
+            addItemToReset(filter.items[j], itemsToReset);
+          }
         } else {
-            setOptions(this.filterPluginInstance, options);
+          addItemToReset(filter.items, itemsToReset);
         }
-    };
+      }
+      for (var i = 0; i < itemsToReset.length; i++) {
+        itemsToReset[i].reset();
+      }
+    }
+  }
 
-    /**
-     * @class FilterPlugin
-     * @param {Object} options The options
-     * @param {OpenSeadragon.Viewer} options.viewer The viewer to attach this
-     * plugin to.
-     * @param {String} [options.loadMode='async'] Set to sync to have the filters
-     * applied synchronously. It will only work if the filters are all synchronous.
-     * Note that depending on how complex the filters are, it may also hang the browser.
-     * @param {Object[]} options.filters The filters to apply to the images.
-     * @param {OpenSeadragon.TiledImage[]} options.filters[x].items The tiled images
-     * on which to apply the filter.
-     * @param {function|function[]} options.filters[x].processors The processing
-     * function(s) to apply to the images. The parameters of this function are
-     * the context to modify and a callback to call upon completion.
-     */
-    $.FilterPlugin = function(options) {
-        options = options || {};
-        if (!options.viewer) {
-            throw new Error('A viewer must be specified.');
+  function addItemToReset(item, itemsToReset) {
+    if (itemsToReset.indexOf(item) >= 0) {
+      throw new Error('An item can not have filters assigned multiple times.');
+    }
+    itemsToReset.push(item);
+  }
+
+  function getAllItems(world) {
+    var result = [];
+    for (var i = 0; i < world.getItemCount(); i++) {
+      result.push(world.getItemAt(i));
+    }
+    return result;
+  }
+
+  function getFiltersProcessors(instance, item) {
+    if (instance.filters.length === 0) {
+      return [];
+    }
+
+    var globalProcessors = null;
+    for (var i = 0; i < instance.filters.length; i++) {
+      var filter = instance.filters[i];
+      if (!filter.items) {
+        globalProcessors = filter.processors;
+      } else if (filter.items === item || ($.isArray(filter.items) && filter.items.indexOf(item) >= 0)) {
+        return filter.processors;
+      }
+    }
+    return globalProcessors ? globalProcessors : [];
+  }
+
+  $.Filters = {
+    THRESHOLDING: function (threshold) {
+      if (threshold < 0 || threshold > 255) {
+        throw new Error('Threshold must be between 0 and 255.');
+      }
+      return function (context, callback) {
+        var imgData = context.getImageData(0, 0, context.canvas.width, context.canvas.height);
+        var pixels = imgData.data;
+        for (var i = 0; i < pixels.length; i += 4) {
+          var r = pixels[i];
+          var g = pixels[i + 1];
+          var b = pixels[i + 2];
+          var v = (r + g + b) / 3;
+          pixels[i] = pixels[i + 1] = pixels[i + 2] = v < threshold ? 0 : 255;
         }
-        var self = this;
-        this.viewer = options.viewer;
-
-        this.viewer.addHandler('tile-loaded', tileLoadedHandler);
-        this.viewer.addHandler('tile-drawing', tileDrawingHandler);
-
-        // filterIncrement allows to determine whether a tile contains the
-        // latest filters results.
-        this.filterIncrement = 0;
-
-        setOptions(this, options);
-
-
-        function tileLoadedHandler(event) {
-            var processors = getFiltersProcessors(self, event.tiledImage);
-            if (processors.length === 0) {
-                return;
-            }
-            var tile = event.tile;
-            var image = event.image;
-            if (image !== null && image !== undefined) {
-                var canvas = window.document.createElement('canvas');
-                canvas.width = image.width;
-                canvas.height = image.height;
-                var context = canvas.getContext('2d');
-                context.drawImage(image, 0, 0);
-                tile._renderedContext = context;
-                var callback = event.getCompletionCallback();
-                applyFilters(context, processors, callback);
-                tile._filterIncrement = self.filterIncrement;
-            }
+        context.putImageData(imgData, 0, 0);
+        callback();
+      };
+    },
+    BRIGHTNESS: function (adjustment) {
+      if (adjustment < -255 || adjustment > 255) {
+        throw new Error('Brightness adjustment must be between -255 and 255.');
+      }
+      var precomputedBrightness = [];
+      for (var i = 0; i < 256; i++) {
+        precomputedBrightness[i] = i + adjustment;
+      }
+      return function (context, callback) {
+        var imgData = context.getImageData(0, 0, context.canvas.width, context.canvas.height);
+        var pixels = imgData.data;
+        for (var i = 0; i < pixels.length; i += 4) {
+          pixels[i] = precomputedBrightness[pixels[i]];
+          pixels[i + 1] = precomputedBrightness[pixels[i + 1]];
+          pixels[i + 2] = precomputedBrightness[pixels[i + 2]];
         }
+        context.putImageData(imgData, 0, 0);
+        callback();
+      };
+    },
+    CONTRAST: function (adjustment) {
+      if (adjustment < 0) {
+        throw new Error('Contrast adjustment must be positive.');
+      }
+      var precomputedContrast = [];
+      for (var i = 0; i < 256; i++) {
+        precomputedContrast[i] = i * adjustment;
+      }
+      return function (context, callback) {
+        var imgData = context.getImageData(0, 0, context.canvas.width, context.canvas.height);
+        var pixels = imgData.data;
+        for (var i = 0; i < pixels.length; i += 4) {
+          pixels[i] = precomputedContrast[pixels[i]];
+          pixels[i + 1] = precomputedContrast[pixels[i + 1]];
+          pixels[i + 2] = precomputedContrast[pixels[i + 2]];
+        }
+        context.putImageData(imgData, 0, 0);
+        callback();
+      };
+    },
+    GAMMA: function (adjustment) {
+      if (adjustment < 0) {
+        throw new Error('Gamma adjustment must be positive.');
+      }
+      var precomputedGamma = [];
+      for (var i = 0; i < 256; i++) {
+        precomputedGamma[i] = Math.pow(i / 255, adjustment) * 255;
+      }
+      return function (context, callback) {
+        var imgData = context.getImageData(0, 0, context.canvas.width, context.canvas.height);
+        var pixels = imgData.data;
+        for (var i = 0; i < pixels.length; i += 4) {
+          pixels[i] = precomputedGamma[pixels[i]];
+          pixels[i + 1] = precomputedGamma[pixels[i + 1]];
+          pixels[i + 2] = precomputedGamma[pixels[i + 2]];
+        }
+        context.putImageData(imgData, 0, 0);
+        callback();
+      };
+    },
+    GREYSCALE: function () {
+      return function (context, callback) {
+        var imgData = context.getImageData(0, 0, context.canvas.width, context.canvas.height);
+        var pixels = imgData.data;
+        for (var i = 0; i < pixels.length; i += 4) {
+          var val = (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3;
+          pixels[i] = val;
+          pixels[i + 1] = val;
+          pixels[i + 2] = val;
+        }
+        context.putImageData(imgData, 0, 0);
+        callback();
+      };
+    },
+    INVERT: function () {
+      var precomputedInvert = [];
+      for (var i = 0; i < 256; i++) {
+        precomputedInvert[i] = 255 - i;
+      }
+      return function (context, callback) {
+        var imgData = context.getImageData(0, 0, context.canvas.width, context.canvas.height);
+        var pixels = imgData.data;
+        for (var i = 0; i < pixels.length; i += 4) {
+          pixels[i] = precomputedInvert[pixels[i]];
+          pixels[i + 1] = precomputedInvert[pixels[i + 1]];
+          pixels[i + 2] = precomputedInvert[pixels[i + 2]];
+        }
+        context.putImageData(imgData, 0, 0);
+        callback();
+      };
+    },
+    MORPHOLOGICAL_OPERATION: function (kernelSize, comparator) {
+      if (kernelSize % 2 === 0) {
+        throw new Error('The kernel size must be an odd number.');
+      }
+      var kernelHalfSize = Math.floor(kernelSize / 2);
 
+      if (!comparator) {
+        throw new Error('A comparator must be defined.');
+      }
 
-        function applyFilters(context, filtersProcessors, callback) {
-            if (callback) {
-                var currentIncrement = self.filterIncrement;
-                var callbacks = [];
-                for (var i = 0; i < filtersProcessors.length - 1; i++) {
-                    (function(i) {
-                        callbacks[i] = function() {
-                            // If the increment has changed, stop the computation
-                            // chain immediately.
-                            if (self.filterIncrement !== currentIncrement) {
-                                return;
-                            }
-                            filtersProcessors[i + 1](context, callbacks[i + 1]);
-                        };
-                    })(i);
+      return function (context, callback) {
+        var width = context.canvas.width;
+        var height = context.canvas.height;
+        var imgData = context.getImageData(0, 0, width, height);
+        var originalPixels = context.getImageData(0, 0, width, height).data;
+        var offset;
+
+        for (var y = 0; y < height; y++) {
+          for (var x = 0; x < width; x++) {
+            offset = (y * width + x) * 4;
+            var r = originalPixels[offset];
+            var g = originalPixels[offset + 1];
+            var b = originalPixels[offset + 2];
+            for (var j = 0; j < kernelSize; j++) {
+              for (var i = 0; i < kernelSize; i++) {
+                var pixelX = x + i - kernelHalfSize;
+                var pixelY = y + j - kernelHalfSize;
+                if (pixelX >= 0 && pixelX < width && pixelY >= 0 && pixelY < height) {
+                  offset = (pixelY * width + pixelX) * 4;
+                  r = comparator(originalPixels[offset], r);
+                  g = comparator(originalPixels[offset + 1], g);
+                  b = comparator(originalPixels[offset + 2], b);
                 }
-                callbacks[filtersProcessors.length - 1] = function() {
-                    // If the increment has changed, do not call the callback.
-                    // (We don't want OSD to draw an outdated tile in the canvas).
-                    if (self.filterIncrement !== currentIncrement) {
-                        return;
-                    }
-                    callback();
-                };
-                filtersProcessors[0](context, callbacks[0]);
-            } else {
-                for (var i = 0; i < filtersProcessors.length; i++) {
-                    filtersProcessors[i](context, function() {
-                    });
-                }
+              }
             }
+            imgData.data[offset] = r;
+            imgData.data[offset + 1] = g;
+            imgData.data[offset + 2] = b;
+          }
         }
-
-        function tileDrawingHandler(event) {
-            var tile = event.tile;
-            var rendered = event.rendered;
-            if (rendered._filterIncrement === self.filterIncrement) {
-                return;
-            }
-            var processors = getFiltersProcessors(self, event.tiledImage);
-            if (processors.length === 0) {
-                if (rendered._originalImageData) {
-                    // Restore initial data.
-                    rendered.putImageData(rendered._originalImageData, 0, 0);
-                    delete rendered._originalImageData;
-                }
-                rendered._filterIncrement = self.filterIncrement;
-                return;
-            }
-
-            if (rendered._originalImageData) {
-                // The tile has been previously filtered (by another filter),
-                // restore it first.
-                rendered.putImageData(rendered._originalImageData, 0, 0);
-            } else {
-                rendered._originalImageData = rendered.getImageData(
-                    0, 0, rendered.canvas.width, rendered.canvas.height);
-            }
-
-            if (tile._renderedContext) {
-                if (tile._filterIncrement === self.filterIncrement) {
-                    var imgData = tile._renderedContext.getImageData(0, 0,
-                        tile._renderedContext.canvas.width,
-                        tile._renderedContext.canvas.height);
-                    rendered.putImageData(imgData, 0, 0);
-                    delete tile._renderedContext;
-                    delete tile._filterIncrement;
-                    rendered._filterIncrement = self.filterIncrement;
-                    return;
-                }
-                delete tile._renderedContext;
-                delete tile._filterIncrement;
-            }
-            applyFilters(rendered, processors);
-            rendered._filterIncrement = self.filterIncrement;
-        }
-    };
-
-    function setOptions(instance, options) {
-        options = options || {};
-        var filters = options.filters;
-        instance.filters = !filters ? [] :
-            $.isArray(filters) ? filters : [filters];
-        for (var i = 0; i < instance.filters.length; i++) {
-            var filter = instance.filters[i];
-            if (!filter.processors) {
-                throw new Error('Filter processors must be specified.');
-            }
-            filter.processors = $.isArray(filter.processors) ?
-                filter.processors : [filter.processors];
-        }
-        instance.filterIncrement++;
-
-        if (options.loadMode === 'sync') {
-            instance.viewer.forceRedraw();
+        context.putImageData(imgData, 0, 0);
+        callback();
+      };
+    },
+    COLORMAP: function (cmap, ctr) {
+      var resampledCmap = cmap.slice(0);
+      var diff = 255 - ctr;
+      for (var i = 0; i < 256; i++) {
+        var position = 0;
+        if (i > ctr) {
+          position = Math.min(((i - ctr) / diff) * 128 + 128, 255) | 0;
         } else {
-            var itemsToReset = [];
-            for (var i = 0; i < instance.filters.length; i++) {
-                var filter = instance.filters[i];
-                if (!filter.items) {
-                    itemsToReset = getAllItems(instance.viewer.world);
-                    break;
-                }
-                if ($.isArray(filter.items)) {
-                    for (var j = 0; j < filter.items.length; j++) {
-                        addItemToReset(filter.items[j], itemsToReset);
-                    }
-                } else {
-                    addItemToReset(filter.items, itemsToReset);
-                }
-            }
-            for (var i = 0; i < itemsToReset.length; i++) {
-                itemsToReset[i].reset();
-            }
+          position = Math.max(0, (i / (ctr / 128)) | 0);
         }
+        resampledCmap[i] = cmap[position];
+      }
+      return function (context, callback) {
+        var imgData = context.getImageData(0, 0, context.canvas.width, context.canvas.height);
+        var pxl = imgData.data;
+        for (var i = 0; i < pxl.length; i += 4) {
+          var v = ((pxl[i] + pxl[i + 1] + pxl[i + 2]) / 3) | 0;
+          var c = resampledCmap[v];
+          pxl[i] = c[0];
+          pxl[i + 1] = c[1];
+          pxl[i + 2] = c[2];
+        }
+        context.putImageData(imgData, 0, 0);
+        callback();
+      };
+    },
+    COLORIZE: function (red, green, blue, strength) {
+      return function (context, callback) {
+        var imgData = context.getImageData(0, 0, context.canvas.width, context.canvas.height);
+        var pixels = imgData.data;
+        for (var i = 0; i < pixels.length; i += 4) {
+          pixels[i] = pixels[i] * (1 - strength / 100) + red * (strength / 100);
+          pixels[i + 1] = pixels[i + 1] * (1 - strength / 100) + green * (strength / 100);
+          pixels[i + 2] = pixels[i + 2] * (1 - strength / 100) + blue * (strength / 100);
+        }
+        context.putImageData(imgData, 0, 0);
+        callback();
+      };
+    },
+    EXPOSURE: function (adjustment) {
+      if (adjustment < -100 || adjustment > 100) {
+        throw new Error('Exposure adjustment must be between -100 and 100.');
+      }
+      return function (context, callback) {
+        var imgData = context.getImageData(0, 0, context.canvas.width, context.canvas.height);
+        var pixels = imgData.data;
+        for (var i = 0; i < pixels.length; i += 4) {
+          pixels[i] = pixels[i] * (1 + adjustment / 100);
+          pixels[i + 1] = pixels[i + 1] * (1 + adjustment / 100);
+          pixels[i + 2] = pixels[i + 2] * (1 + adjustment / 100);
+        }
+        context.putImageData(imgData, 0, 0);
+        callback();
+      };
+    },
+    HUE: function (adjustment) {
+      if (adjustment < 0 || adjustment > 100) {
+        throw new Error('Hue adjustment must be between 0 and 100.');
+      }
+      return function (context, callback) {
+        var imgData = context.getImageData(0, 0, context.canvas.width, context.canvas.height);
+        var pixels = imgData.data;
+        for (var i = 0; i < pixels.length; i += 4) {
+          var hsl = rgbToHsl(pixels[i], pixels[i + 1], pixels[i + 2]);
+          hsl[0] += adjustment / 100;
+          if (hsl[0] > 1) hsl[0] -= 1;
+          var rgb = hslToRgb(hsl[0], hsl[1], hsl[2]);
+          pixels[i] = rgb[0];
+          pixels[i + 1] = rgb[1];
+          pixels[i + 2] = rgb[2];
+        }
+        context.putImageData(imgData, 0, 0);
+        callback();
+      };
+    },
+    NOISE: function (adjustment) {
+      if (adjustment < 0) {
+        throw new Error('Noise adjustment must be positive.');
+      }
+      return function (context, callback) {
+        var imgData = context.getImageData(0, 0, context.canvas.width, context.canvas.height);
+        var pixels = imgData.data;
+        for (var i = 0; i < pixels.length; i += 4) {
+          var noise = (Math.random() - 0.5) * adjustment;
+          pixels[i] += noise;
+          pixels[i + 1] += noise;
+          pixels[i + 2] += noise;
+        }
+        context.putImageData(imgData, 0, 0);
+        callback();
+      };
+    },
+    SATURATION: function (adjustment) {
+      if (adjustment < -100 || adjustment > 100) {
+        throw new Error('Saturation adjustment must be between -100 and 100.');
+      }
+      return function (context, callback) {
+        var imgData = context.getImageData(0, 0, context.canvas.width, context.canvas.height);
+        var pixels = imgData.data;
+        for (var i = 0; i < pixels.length; i += 4) {
+          var hsl = rgbToHsl(pixels[i], pixels[i + 1], pixels[i + 2]);
+          hsl[1] += adjustment / 100;
+          if (hsl[1] > 1) hsl[1] = 1;
+          if (hsl[1] < 0) hsl[1] = 0;
+          var rgb = hslToRgb(hsl[0], hsl[1], hsl[2]);
+          pixels[i] = rgb[0];
+          pixels[i + 1] = rgb[1];
+          pixels[i + 2] = rgb[2];
+        }
+        context.putImageData(imgData, 0, 0);
+        callback();
+      };
+    },
+    SEPIA: function (adjustment) {
+      if (adjustment < 0 || adjustment > 100) {
+        throw new Error('Sepia adjustment must be between 0 and 100.');
+      }
+      return function (context, callback) {
+        var imgData = context.getImageData(0, 0, context.canvas.width, context.canvas.height);
+        var pixels = imgData.data;
+        for (var i = 0; i < pixels.length; i += 4) {
+          var r = pixels[i];
+          var g = pixels[i + 1];
+          var b = pixels[i + 2];
+          pixels[i] = r * (1 - adjustment / 100) + 112 * (adjustment / 100);
+          pixels[i + 1] = g * (1 - adjustment / 100) + 66 * (adjustment / 100);
+          pixels[i + 2] = b * (1 - adjustment / 100) + 20 * (adjustment / 100);
+        }
+        context.putImageData(imgData, 0, 0);
+        callback();
+      };
+    },
+    SOBEL_EDGE: function () {
+      return function (context, callback) {
+        var imgData = context.getImageData(0, 0, context.canvas.width, context.canvas.height);
+        var pixels = imgData.data;
+        var originalPixels = context.getImageData(0, 0, context.canvas.width, context.canvas.height).data;
+        var oneRowOffset = context.canvas.width * 4;
+        var onePixelOffset = 4;
+        var Gy, Gx;
+        var idx = 0;
+        for (var i = 1; i < context.canvas.height - 1; i += 1) {
+          idx = oneRowOffset * i + 4;
+          for (var j = 1; j < context.canvas.width - 1; j += 1) {
+            Gy =
+              originalPixels[idx - onePixelOffset + oneRowOffset] +
+              2 * originalPixels[idx + oneRowOffset] +
+              originalPixels[idx + onePixelOffset + oneRowOffset];
+            Gy =
+              Gy -
+              (originalPixels[idx - onePixelOffset - oneRowOffset] +
+                2 * originalPixels[idx - oneRowOffset] +
+                originalPixels[idx + onePixelOffset - oneRowOffset]);
+            Gx =
+              originalPixels[idx + onePixelOffset - oneRowOffset] +
+              2 * originalPixels[idx + onePixelOffset] +
+              originalPixels[idx + onePixelOffset + oneRowOffset];
+            Gx =
+              Gx -
+              (originalPixels[idx - onePixelOffset - oneRowOffset] +
+                2 * originalPixels[idx - onePixelOffset] +
+                originalPixels[idx - onePixelOffset + oneRowOffset]);
+            pixels[idx] = Math.sqrt(Gx * Gx + Gy * Gy);
+            pixels[idx + 1] = 0;
+            pixels[idx + 2] = 0;
+            idx += 4;
+          }
+        }
+        context.putImageData(imgData, 0, 0);
+        callback();
+      };
+    },
+    VIBRANCE: function (adjustment) {
+      if (adjustment < -100 || adjustment > 100) {
+        throw new Error('Vibrance adjustment must be between -100 and 100.');
+      }
+      return function (context, callback) {
+        var imgData = context.getImageData(0, 0, context.canvas.width, context.canvas.height);
+        var pixels = imgData.data;
+        for (var i = 0; i < pixels.length; i += 4) {
+          var max = Math.max(pixels[i], pixels[i + 1], pixels[i + 2]);
+          var avg = (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3;
+          var amt = ((max - avg) * (1 - Math.abs(adjustment / 100))) * (adjustment > 0 ? 1 : -1);
+          pixels[i] += pixels[i] !== max ? amt : 0;
+          pixels[i + 1] += pixels[i + 1] !== max ? amt : 0;
+          pixels[i + 2] += pixels[i + 2] !== max ? amt : 0;
+        }
+        context.putImageData(imgData, 0, 0);
+        callback();
+      };
+    }
+  };
+
+  // Utility functions
+  function rgbToHsl(r, g, b) {
+    r /= 255;
+    g /= 255;
+    b /= 255;
+    var max = Math.max(r, g, b);
+    var min = Math.min(r, g, b);
+    var h, s, l = (max + min) / 2;
+
+    if (max === min) {
+      h = s = 0; // achromatic
+    } else {
+      var d = max - min;
+      s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+      switch (max) {
+        case r:
+          h = (g - b) / d + (g < b ? 6 : 0);
+          break;
+        case g:
+          h = (b - r) / d + 2;
+          break;
+        case b:
+          h = (r - g) / d + 4;
+          break;
+      }
+      h /= 6;
+    }
+    return [h, s, l];
+  }
+
+  function hslToRgb(h, s, l) {
+    var r, g, b;
+
+    if (s === 0) {
+      r = g = b = l; // achromatic
+    } else {
+      var hue2rgb = function (p, q, t) {
+        if (t < 0) t += 1;
+        if (t > 1) t -= 1;
+        if (t < 1 / 6) return p + (q - p) * 6 * t;
+        if (t < 1 / 3) return q;
+        if (t < 1 / 2) return p + (q - p) * (2 / 3 - t) * 6;
+        return p;
+      };
+
+      var q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+      var p = 2 * l - q;
+      r = hue2rgb(p, q, h + 1 / 3);
+      g = hue2rgb(p, q, h);
+      b = hue2rgb(p, q, h - 1 / 3);
     }
 
-    function addItemToReset(item, itemsToReset) {
-        if (itemsToReset.indexOf(item) >= 0) {
-            throw new Error('An item can not have filters ' +
-                'assigned multiple times.');
-        }
-        itemsToReset.push(item);
-    }
-
-    function getAllItems(world) {
-        var result = [];
-        for (var i = 0; i < world.getItemCount(); i++) {
-            result.push(world.getItemAt(i));
-        }
-        return result;
-    }
-
-    function getFiltersProcessors(instance, item) {
-        if (instance.filters.length === 0) {
-            return [];
-        }
-
-        var globalProcessors = null;
-        for (var i = 0; i < instance.filters.length; i++) {
-            var filter = instance.filters[i];
-            if (!filter.items) {
-                globalProcessors = filter.processors;
-            } else if (filter.items === item ||
-                $.isArray(filter.items) && filter.items.indexOf(item) >= 0) {
-                return filter.processors;
-            }
-        }
-        return globalProcessors ? globalProcessors : [];
-    }
-
-    $.Filters = {
-        THRESHOLDING: function(threshold) {
-            if (threshold < 0 || threshold > 255) {
-                throw new Error('Threshold must be between 0 and 255.');
-            }
-            return function(context, callback) {
-                var imgData = context.getImageData(
-                    0, 0, context.canvas.width, context.canvas.height);
-                var pixels = imgData.data;
-                for (var i = 0; i < pixels.length; i += 4) {
-                    var r = pixels[i];
-                    var g = pixels[i + 1];
-                    var b = pixels[i + 2];
-                    var v = (r + g + b) / 3;
-                    pixels[i] = pixels[i + 1] = pixels[i + 2] =
-                        v < threshold ? 0 : 255;
-                }
-                context.putImageData(imgData, 0, 0);
-                callback();
-            };
-        },
-        BRIGHTNESS: function(adjustment) {
-            if (adjustment < -255 || adjustment > 255) {
-                throw new Error(
-                    'Brightness adjustment must be between -255 and 255.');
-            }
-            var precomputedBrightness = [];
-            for (var i = 0; i < 256; i++) {
-                precomputedBrightness[i] = i + adjustment;
-            }
-            return function(context, callback) {
-                var imgData = context.getImageData(
-                    0, 0, context.canvas.width, context.canvas.height);
-                var pixels = imgData.data;
-                for (var i = 0; i < pixels.length; i += 4) {
-                    pixels[i] = precomputedBrightness[pixels[i]];
-                    pixels[i + 1] = precomputedBrightness[pixels[i + 1]];
-                    pixels[i + 2] = precomputedBrightness[pixels[i + 2]];
-                }
-                context.putImageData(imgData, 0, 0);
-                callback();
-            };
-        },
-        CONTRAST: function(adjustment) {
-            if (adjustment < 0) {
-                throw new Error('Contrast adjustment must be positive.');
-            }
-            var precomputedContrast = [];
-            for (var i = 0; i < 256; i++) {
-                precomputedContrast[i] = i * adjustment;
-            }
-            return function(context, callback) {
-                var imgData = context.getImageData(
-                    0, 0, context.canvas.width, context.canvas.height);
-                var pixels = imgData.data;
-                for (var i = 0; i < pixels.length; i += 4) {
-                    pixels[i] = precomputedContrast[pixels[i]];
-                    pixels[i + 1] = precomputedContrast[pixels[i + 1]];
-                    pixels[i + 2] = precomputedContrast[pixels[i + 2]];
-                }
-                context.putImageData(imgData, 0, 0);
-                callback();
-            };
-        },
-        GAMMA: function(adjustment) {
-            if (adjustment < 0) {
-                throw new Error('Gamma adjustment must be positive.');
-            }
-            var precomputedGamma = [];
-            for (var i = 0; i < 256; i++) {
-                precomputedGamma[i] = Math.pow(i / 255, adjustment) * 255;
-            }
-            return function(context, callback) {
-                var imgData = context.getImageData(
-                    0, 0, context.canvas.width, context.canvas.height);
-                var pixels = imgData.data;
-                for (var i = 0; i < pixels.length; i += 4) {
-                    pixels[i] = precomputedGamma[pixels[i]];
-                    pixels[i + 1] = precomputedGamma[pixels[i + 1]];
-                    pixels[i + 2] = precomputedGamma[pixels[i + 2]];
-                }
-                context.putImageData(imgData, 0, 0);
-                callback();
-            };
-        },
-        GREYSCALE: function() {
-            return function(context, callback) {
-                var imgData = context.getImageData(
-                    0, 0, context.canvas.width, context.canvas.height);
-                var pixels = imgData.data;
-                for (var i = 0; i < pixels.length; i += 4) {
-                    var val = (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3;
-                    pixels[i] = val;
-                    pixels[i + 1] = val;
-                    pixels[i + 2] = val;
-                }
-                context.putImageData(imgData, 0, 0);
-                callback();
-            };
-        },
-        INVERT: function() {
-            var precomputedInvert = [];
-            for (var i = 0; i < 256; i++) {
-                precomputedInvert[i] = 255 - i;
-            }
-            return function(context, callback) {
-                var imgData = context.getImageData(
-                    0, 0, context.canvas.width, context.canvas.height);
-                var pixels = imgData.data;
-                for (var i = 0; i < pixels.length; i += 4) {
-                    pixels[i] = precomputedInvert[pixels[i]];
-                    pixels[i + 1] = precomputedInvert[pixels[i + 1]];
-                    pixels[i + 2] = precomputedInvert[pixels[i + 2]];
-                }
-                context.putImageData(imgData, 0, 0);
-                callback();
-            };
-        },
-        MORPHOLOGICAL_OPERATION: function(kernelSize, comparator) {
-            if (kernelSize % 2 === 0) {
-                throw new Error('The kernel size must be an odd number.');
-            }
-            var kernelHalfSize = Math.floor(kernelSize / 2);
-
-            if (!comparator) {
-                throw new Error('A comparator must be defined.');
-            }
-
-            return function(context, callback) {
-                var width = context.canvas.width;
-                var height = context.canvas.height;
-                var imgData = context.getImageData(0, 0, width, height);
-                var originalPixels = context.getImageData(0, 0, width, height)
-                    .data;
-                var offset;
-
-                for (var y = 0; y < height; y++) {
-                    for (var x = 0; x < width; x++) {
-                        offset = (y * width + x) * 4;
-                        var r = originalPixels[offset];
-                        var g = originalPixels[offset + 1];
-                        var b = originalPixels[offset + 2];
-                        for (var j = 0; j < kernelSize; j++) {
-                            for (var i = 0; i < kernelSize; i++) {
-                                var pixelX = x + i - kernelHalfSize;
-                                var pixelY = y + j - kernelHalfSize;
-                                if (pixelX >= 0 && pixelX < width &&
-                                    pixelY >= 0 && pixelY < height) {
-                                    offset = (pixelY * width + pixelX) * 4;
-                                    r = comparator(originalPixels[offset], r);
-                                    g = comparator(
-                                        originalPixels[offset + 1], g);
-                                    b = comparator(
-                                        originalPixels[offset + 2], b);
-                                }
-                            }
-                        }
-                        imgData.data[offset] = r;
-                        imgData.data[offset + 1] = g;
-                        imgData.data[offset + 2] = b;
-                    }
-                }
-                context.putImageData(imgData, 0, 0);
-                callback();
-            };
-        },
-        CONVOLUTION: function(kernel) {
-            if (!$.isArray(kernel)) {
-                throw new Error('The kernel must be an array.');
-            }
-            var kernelSize = Math.sqrt(kernel.length);
-            if ((kernelSize + 1) % 2 !== 0) {
-                throw new Error('The kernel must be a square matrix with odd' +
-                    'width and height.');
-            }
-            var kernelHalfSize = (kernelSize - 1) / 2;
-
-            return function(context, callback) {
-                var width = context.canvas.width;
-                var height = context.canvas.height;
-                var imgData = context.getImageData(0, 0, width, height);
-                var originalPixels = context.getImageData(0, 0, width, height)
-                    .data;
-                var offset;
-
-                for (var y = 0; y < height; y++) {
-                    for (var x = 0; x < width; x++) {
-                        var r = 0;
-                        var g = 0;
-                        var b = 0;
-                        for (var j = 0; j < kernelSize; j++) {
-                            for (var i = 0; i < kernelSize; i++) {
-                                var pixelX = x + i - kernelHalfSize;
-                                var pixelY = y + j - kernelHalfSize;
-                                if (pixelX >= 0 && pixelX < width &&
-                                    pixelY >= 0 && pixelY < height) {
-                                    offset = (pixelY * width + pixelX) * 4;
-                                    var weight = kernel[j * kernelSize + i];
-                                    r += originalPixels[offset] * weight;
-                                    g += originalPixels[offset + 1] * weight;
-                                    b += originalPixels[offset + 2] * weight;
-                                }
-                            }
-                        }
-                        offset = (y * width + x) * 4;
-                        imgData.data[offset] = r;
-                        imgData.data[offset + 1] = g;
-                        imgData.data[offset + 2] = b;
-                    }
-                }
-                context.putImageData(imgData, 0, 0);
-                callback();
-            };
-        },
-        COLORMAP: function(cmap, ctr) {
-            var resampledCmap = cmap.slice(0);
-            var diff = 255 - ctr;
-            for(var i = 0; i < 256; i++) {
-                var position = 0;
-                if(i > ctr) {
-                    position = Math.min((i - ctr) / diff * 128 + 128,255) | 0;
-                }else{
-                    position = Math.max(0, i / (ctr / 128)) | 0;
-                }
-                resampledCmap[i] = cmap[position];
-            }
-            return function(context, callback) {
-                var imgData = context.getImageData(
-                    0, 0, context.canvas.width, context.canvas.height);
-                var pxl = imgData.data;
-                for (var i = 0; i < pxl.length; i += 4) {
-                    var v = (pxl[i] + pxl[i + 1] + pxl[i + 2]) / 3 | 0;
-                    var c = resampledCmap[v];
-                    pxl[i] = c[0];
-                    pxl[i + 1] = c[1];
-                    pxl[i + 2] = c[2];
-                }
-                context.putImageData(imgData, 0, 0);
-                callback();
-            };
-        }
-    };
-
-}());
+    return [r * 255, g * 255, b * 255];
+  }
+})();
